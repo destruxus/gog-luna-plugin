@@ -264,6 +264,23 @@ class LunaPlugin(Plugin):
     # Authentication
     # ------------------------------------------------------------------
 
+    async def _fetch_luna_page_html(self):
+        """Fetch luna.amazon.se homepage HTML, or None on failure."""
+        try:
+            http = await self._get_session()
+            async with http.get(
+                "https://luna.amazon.se/",
+                headers={
+                    "User-Agent": _USER_AGENT,
+                    "Cookie": _cookie_header(self._cookies),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            ) as resp:
+                return await resp.text()
+        except Exception as exc:
+            logger.warning("Could not fetch Luna homepage: %s", exc)
+            return None
+
     async def _fetch_user_profile(self):
         """Return (user_id, display_name) from the Amazon homepage."""
         user_id = self._cookies.get("session-id", "luna-user")
@@ -285,6 +302,19 @@ class LunaPlugin(Plugin):
         except Exception as exc:
             logger.warning("Could not fetch Amazon homepage: %s", exc)
         return user_id, user_id
+
+    async def _fetch_subscription_owned(self):
+        """Return True if the Luna page shows an active subscriber_tier."""
+        html = await self._fetch_luna_page_html()
+        if not html:
+            return False
+        match = re.search(r'data-test-id="subscriber_tier">([^<]+)<', html)
+        if match:
+            tier = match.group(1).strip()
+            logger.info("Luna subscriber_tier: %s", tier)
+            return True
+        logger.info("subscriber_tier not found — user may not have Luna access")
+        return False
 
     async def authenticate(self, stored_credentials=None):
         if stored_credentials:
@@ -330,10 +360,11 @@ class LunaPlugin(Plugin):
     async def get_subscriptions(self):
         if not self._cookies:
             raise AuthenticationRequired()
+        owned = await self._fetch_subscription_owned()
         return [
             Subscription(
                 subscription_name=_SUBSCRIPTION_NAME,
-                owned=True,
+                owned=owned,
                 subscription_discovery=SubscriptionDiscovery.AUTOMATIC,
             )
         ]
