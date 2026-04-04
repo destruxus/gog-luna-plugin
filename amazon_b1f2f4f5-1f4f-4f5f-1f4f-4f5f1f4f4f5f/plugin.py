@@ -111,13 +111,16 @@ def _cookie_header(cookies):
     return "; ".join("{}={}".format(k, v) for k, v in cookies.items())
 
 
-def _extract_titles(page_data):
+def _extract_titles(page_data, label="page"):
     """Walk the page widget tree, return {game_id: title} for all tiles."""
     games = {}
+    type_counts = {}
 
     def walk(widgets):
         for widget in widgets:
-            if widget.get("type") == "GAME_TILE_VERTICAL":
+            wtype = widget.get("type", "UNKNOWN")
+            type_counts[wtype] = type_counts.get(wtype, 0) + 1
+            if wtype == "GAME_TILE_VERTICAL":
                 raw = widget.get("presentationData", "{}")
                 try:
                     pd = json.loads(raw)
@@ -127,12 +130,28 @@ def _extract_titles(page_data):
                 title = pd.get("title")
                 if game_id and title and game_id not in games:
                     games[game_id] = title
+                elif game_id and not title:
+                    logger.debug(
+                        "[%s] tile has gameId=%s but no title", label, game_id
+                    )
             if "widgets" in widget:
                 walk(widget["widgets"])
 
-    for group in page_data.get("pageMemberGroups", {}).values():
+    groups = page_data.get("pageMemberGroups", {})
+    logger.info(
+        "[%s] pageMemberGroups: %s",
+        label,
+        {k: len(v.get("widgets", [])) for k, v in groups.items()},
+    )
+    top_keys = [
+        k for k in page_data if k not in ("pageMemberGroups",)
+    ]
+    logger.info("[%s] other top-level keys: %s", label, top_keys)
+
+    for group in groups.values():
         walk(group.get("widgets", []))
 
+    logger.info("[%s] widget types seen: %s", label, type_counts)
     return games
 
 
@@ -287,15 +306,33 @@ class LunaPlugin(Plugin):
     async def get_subscription_games(self, subscription_name, context):
         if not self._cookies:
             raise AuthenticationRequired()
-        data = await self._fetch_page("landing_library")
-        if data is None:
+
+        # Fetch from multiple page types and merge, deduplicated by game_id.
+        # landing_library  = "My Stuff" (games user has access to)
+        # landing_home     = Luna home page (broader catalog, also auth-gated)
+        all_titles = {}
+        for page_type in ("landing_library", "landing_home"):
+            data = await self._fetch_page(page_type)
+            if data is None:
+                logger.warning("getPage(%s) returned nothing", page_type)
+                continue
+            found = _extract_titles(data, label=page_type)
+            new_count = sum(1 for gid in found if gid not in all_titles)
+            all_titles.update(found)
+            logger.info(
+                "getPage(%s): %d total tiles, %d new",
+                page_type, len(found), new_count,
+            )
+
+        logger.info(
+            "Total subscription games after merging pages: %d", len(all_titles)
+        )
+        if not all_titles:
             yield []
             return
-        titles = _extract_titles(data)
-        logger.info("Found %d subscription games in Luna library", len(titles))
         yield [
             SubscriptionGame(game_title=title, game_id=gid)
-            for gid, title in titles.items()
+            for gid, title in all_titles.items()
         ]
 
 
