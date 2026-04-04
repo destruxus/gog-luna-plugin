@@ -14,6 +14,7 @@ from galaxy.api.consts import LicenseType, Platform, SubscriptionDiscovery
 from galaxy.api.errors import AuthenticationRequired, InvalidCredentials
 from galaxy.api.plugin import Plugin, create_and_run_plugin
 from galaxy.api.types import (
+    Achievement,
     Authentication,
     Game,
     LicenseInfo,
@@ -361,6 +362,53 @@ class LunaPlugin(Plugin):
             SubscriptionGame(game_title=title, game_id=gid)
             for gid, title in titles.items()
         ]
+
+
+    # ------------------------------------------------------------------
+    # Achievements — luna.amazon.se/game/{game_id}/achievements
+    # ------------------------------------------------------------------
+
+    async def get_unlocked_achievements(self, game_id, context):
+        if not self._cookies:
+            raise AuthenticationRequired()
+        data = await self._get_page(
+            "game/{}/achievements".format(game_id)
+        )
+        if data is None:
+            return []
+        # Log full structure so we can identify the achievement widget type.
+        # Parser will be filled in once the widget format is known from logs.
+        groups = data.get("pageMemberGroups", {})
+        logger.info(
+            "[achievements/%s] groups: %s",
+            game_id,
+            {k: len(v.get("widgets", [])) for k, v in groups.items()},
+        )
+        type_counts = {}
+
+        def walk(widgets):
+            for widget in widgets:
+                wtype = widget.get("type", "UNKNOWN")
+                type_counts[wtype] = type_counts.get(wtype, 0) + 1
+                raw = widget.get("presentationData")
+                if raw:
+                    try:
+                        pd = json.loads(raw)
+                        logger.debug(
+                            "[achievements/%s] %s keys: %s",
+                            game_id, wtype, list(pd.keys()),
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                if "widgets" in widget:
+                    walk(widget["widgets"])
+
+        for group in groups.values():
+            walk(group.get("widgets", []))
+        logger.info(
+            "[achievements/%s] widget types: %s", game_id, type_counts
+        )
+        return []
 
 
 def main():
