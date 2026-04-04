@@ -306,33 +306,15 @@ class LunaPlugin(Plugin):
     async def get_subscription_games(self, subscription_name, context):
         if not self._cookies:
             raise AuthenticationRequired()
-
-        # Fetch from multiple page types and merge, deduplicated by game_id.
-        # landing_library  = "My Stuff" (games user has access to)
-        # landing_home     = Luna home page (broader catalog, also auth-gated)
-        all_titles = {}
-        for page_type in ("landing_library", "landing_home"):
-            data = await self._fetch_page(page_type)
-            if data is None:
-                logger.warning("getPage(%s) returned nothing", page_type)
-                continue
-            found = _extract_titles(data, label=page_type)
-            new_count = sum(1 for gid in found if gid not in all_titles)
-            all_titles.update(found)
-            logger.info(
-                "getPage(%s): %d total tiles, %d new",
-                page_type, len(found), new_count,
-            )
-
-        logger.info(
-            "Total subscription games after merging pages: %d", len(all_titles)
-        )
-        if not all_titles:
+        data = await self._fetch_page("landing_library")
+        if data is None:
             yield []
             return
+        titles = _extract_titles(data, label="landing_library")
+        logger.info("Found %d subscription games in Luna library", len(titles))
         yield [
             SubscriptionGame(game_title=title, game_id=gid)
-            for gid, title in all_titles.items()
+            for gid, title in titles.items()
         ]
 
 
