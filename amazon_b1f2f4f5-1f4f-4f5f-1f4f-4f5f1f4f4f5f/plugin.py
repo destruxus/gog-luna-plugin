@@ -1,6 +1,5 @@
 """GOG Galaxy - Amazon Luna Plugin."""
 
-import base64
 import json
 import logging
 import re
@@ -35,13 +34,11 @@ _USER_AGENT = (
     "Chrome/146.0.0.0 Safari/537.36"
 )
 
-_LOGIN_URL = "https://luna.amazon.com/login"
-
 _AUTH_PARAMS = {
     "window_title": "Sign in to Amazon Luna",
     "window_width": 1280,
     "window_height": 720,
-    "start_uri": _LOGIN_URL,
+    "start_uri": "https://luna.amazon.com/login",
     "end_uri_regex": r"https://luna\.amazon\.[a-z]+/(?!login).+",
 }
 
@@ -51,8 +48,8 @@ _API_BASE = "https://proxy-prod.eu-west-1.tempo.digital.a2z.com"
 
 _MARKETPLACE = "A2NODRKZP88ZB9"  # Sweden
 
-# Maps subscriber_tier text (lowercase) from luna.amazon.se to
-# (GOG subscription name, getPage pageUri for the full game list).
+# Maps subscriber_tier (lowercase) found on luna.amazon.se to
+# (GOG subscription name, getPage pageUri).
 _SUBSCRIPTION_TIERS = {
     "luna standard": (
         "Luna Standard",
@@ -83,12 +80,12 @@ _CLIENT_CONTEXT = {
 }
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Request helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_page_context_body(page_uri):
-    """Build a getPage request body using pageContext (URI-based pages)."""
+def _build_body(page_uri):
+    """Build a getPage POST body using pageContext."""
     return json.dumps(
         {
             "timeout": 10000,
@@ -96,17 +93,14 @@ def _build_page_context_body(page_uri):
             "cacheKey": str(uuid.uuid4()),
             "clientContext": _CLIENT_CONTEXT,
             "inputContext": {"gamepadTypes": []},
-            "pageContext": {
-                "pageId": "default",
-                "pageUri": page_uri,
-            },
+            "pageContext": {"pageId": "default", "pageUri": page_uri},
         },
         separators=(",", ":"),
     )
 
 
 def _cookies_from_list(cookie_list):
-    """Extract relevant Amazon session cookies from GOG's cookie list."""
+    """Extract session cookies from GOG's cookie list format."""
     return {
         c["name"]: c["value"]
         for c in cookie_list
@@ -115,12 +109,16 @@ def _cookies_from_list(cookie_list):
 
 
 def _cookie_header(cookies):
-    """Render a cookie dict as a Cookie header string."""
     return "; ".join("{}={}".format(k, v) for k, v in cookies.items())
 
 
+# ---------------------------------------------------------------------------
+# Page parsing
+# ---------------------------------------------------------------------------
+
+
 def _extract_titles(page_data, label="page"):
-    """Walk the page widget tree, return {game_id: title} for all tiles."""
+    """Walk the widget tree and return {game_id: title} for all game tiles."""
     games = {}
     type_counts = {}
 
@@ -129,9 +127,8 @@ def _extract_titles(page_data, label="page"):
             wtype = widget.get("type", "UNKNOWN")
             type_counts[wtype] = type_counts.get(wtype, 0) + 1
             if wtype == "GAME_TILE_VERTICAL":
-                raw = widget.get("presentationData", "{}")
                 try:
-                    pd = json.loads(raw)
+                    pd = json.loads(widget.get("presentationData", "{}"))
                 except (ValueError, TypeError):
                     continue
                 game_id = pd.get("gameId")
@@ -139,28 +136,26 @@ def _extract_titles(page_data, label="page"):
                 if game_id and title and game_id not in games:
                     games[game_id] = title
                 elif game_id and not title:
-                    logger.debug(
-                        "[%s] tile has gameId=%s but no title", label, game_id
-                    )
+                    logger.debug("[%s] tile %s has no title", label, game_id)
             if "widgets" in widget:
                 walk(widget["widgets"])
 
     groups = page_data.get("pageMemberGroups", {})
     logger.info(
-        "[%s] pageMemberGroups: %s",
+        "[%s] groups: %s",
         label,
         {k: len(v.get("widgets", [])) for k, v in groups.items()},
     )
     for group in groups.values():
         walk(group.get("widgets", []))
-
-    logger.info("[%s] widget types seen: %s", label, type_counts)
+    logger.info("[%s] widget types: %s", label, type_counts)
     return games
 
 
 # ---------------------------------------------------------------------------
 # Plugin
 # ---------------------------------------------------------------------------
+
 
 class LunaPlugin(Plugin):
     """Amazon Luna integration for GOG Galaxy."""
@@ -169,13 +164,12 @@ class LunaPlugin(Plugin):
         super().__init__(Platform.Amazon, "1.0.0", reader, writer, token)
         self._cookies = {}
         self._session = None
-        # Cached after authentication
         self._user_id = None
         self._display_name = None
         self._tier_entry = None  # (sub_name, page_uri) or None
 
     # ------------------------------------------------------------------
-    # HTTP helpers
+    # HTTP
     # ------------------------------------------------------------------
 
     async def _get_session(self):
@@ -189,7 +183,7 @@ class LunaPlugin(Plugin):
                 )
         return self._session
 
-    def _build_headers(self):
+    def _api_headers(self):
         at_main = unquote(self._cookies.get("at-main", ""))
         session_id = self._cookies.get("session-id", "")
         return {
@@ -211,92 +205,80 @@ class LunaPlugin(Plugin):
             "x-amz-client-version": "-",
         }
 
-    async def _fetch_page_by_uri(self, page_uri):
-        """Call getPage via pageContext URI and return parsed JSON, or None."""
+    def _browse_headers(self):
+        return {
+            "User-Agent": _USER_AGENT,
+            "Cookie": _cookie_header(self._cookies),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    async def _get_page(self, page_uri):
+        """POST to /getPage and return parsed JSON, or None on error."""
         http = await self._get_session()
         async with http.post(
             _API_BASE + "/getPage",
-            headers=self._build_headers(),
-            data=_build_page_context_body(page_uri),
+            headers=self._api_headers(),
+            data=_build_body(page_uri),
         ) as resp:
             if resp.status != 200:
-                text = await resp.text()
                 logger.error(
-                    "getPage(uri=%s) failed: %s | %s",
-                    page_uri, resp.status, text[:300],
+                    "getPage(%s) → %s | %s",
+                    page_uri, resp.status, (await resp.text())[:300],
                 )
                 return None
             return await resp.json(content_type=None)
+
+    async def _get_html(self, url):
+        """GET a page and return its HTML text, or None on error."""
+        try:
+            http = await self._get_session()
+            async with http.get(url, headers=self._browse_headers()) as resp:
+                return await resp.text()
+        except Exception as exc:
+            logger.warning("GET %s failed: %s", url, exc)
+            return None
 
     async def shutdown(self):
         if self._session and not self._session.closed:
             await self._session.close()
 
     # ------------------------------------------------------------------
-    # Profile + subscription — fetched once, cached for the session
+    # Profile + subscription — loaded once at login
     # ------------------------------------------------------------------
 
     async def _load_user_info(self):
-        """Fetch username from Amazon and subscription tier from Luna.
-        Populates self._user_id, self._display_name, self._tier_entry."""
+        """Populate username and subscription tier from Amazon/Luna pages."""
         self._user_id = self._cookies.get("session-id", "luna-user")
 
-        # 1. Username from amazon.com
-        try:
-            http = await self._get_session()
-            async with http.get(
-                "https://www.amazon.com/",
-                headers={
-                    "User-Agent": _USER_AGENT,
-                    "Cookie": _cookie_header(self._cookies),
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            ) as resp:
-                html = await resp.text()
-            match = re.search(r'data-test-id="profile_name">([^<]+)<', html)
-            if match:
-                self._display_name = match.group(1).strip()
+        # Username
+        html = await self._get_html("https://www.amazon.com/")
+        if html:
+            m = re.search(r'data-test-id="profile_name">([^<]+)<', html)
+            if m:
+                self._display_name = m.group(1).strip()
                 logger.info("Logged in as: %s", self._display_name)
             else:
-                logger.warning("profile_name not found on Amazon homepage")
-                self._display_name = self._user_id
-        except Exception as exc:
-            logger.warning("Could not fetch Amazon homepage: %s", exc)
-            self._display_name = self._user_id
+                logger.warning("profile_name not found on amazon.com")
+        self._display_name = self._display_name or self._user_id
 
-        # 2. Subscription tier from luna.amazon.se
-        try:
-            http = await self._get_session()
-            async with http.get(
-                "https://luna.amazon.se/",
-                headers={
-                    "User-Agent": _USER_AGENT,
-                    "Cookie": _cookie_header(self._cookies),
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            ) as resp:
-                luna_html = await resp.text()
-            match = re.search(
-                r'data-test-id="subscriber_tier">([^<]+)<', luna_html
+        # Subscription tier
+        html = await self._get_html("https://luna.amazon.se/")
+        if html:
+            m = re.search(
+                r'data-test-id="subscriber_tier">([^<]+)<', html
             )
-            if match:
-                tier_raw = match.group(1).strip()
+            if m:
+                tier_raw = m.group(1).strip()
                 logger.info("Luna subscriber_tier: %s", tier_raw)
                 self._tier_entry = _SUBSCRIPTION_TIERS.get(tier_raw.lower())
                 if self._tier_entry is None:
                     logger.warning(
-                        "Unrecognised tier %r — defaulting to Luna Standard",
+                        "Unknown tier %r, defaulting to Luna Standard",
                         tier_raw,
                     )
                     self._tier_entry = _SUBSCRIPTION_TIERS["luna standard"]
             else:
-                logger.info(
-                    "subscriber_tier not found — user may not have Luna access"
-                )
-                self._tier_entry = None
-        except Exception as exc:
-            logger.warning("Could not fetch Luna homepage: %s", exc)
-            self._tier_entry = None
+                logger.info("No subscriber_tier found — no active subscription")
 
     # ------------------------------------------------------------------
     # Authentication
@@ -319,13 +301,13 @@ class LunaPlugin(Plugin):
         return Authentication(self._user_id, self._display_name)
 
     # ------------------------------------------------------------------
-    # Owned games — from /purchased
+    # Owned games — luna.amazon.se/purchased
     # ------------------------------------------------------------------
 
     async def get_owned_games(self):
         if not self._cookies:
             raise AuthenticationRequired()
-        data = await self._fetch_page_by_uri("purchased")
+        data = await self._get_page("purchased")
         if data is None:
             return []
         titles = _extract_titles(data, label="purchased")
@@ -341,7 +323,7 @@ class LunaPlugin(Plugin):
         ]
 
     # ------------------------------------------------------------------
-    # Subscriptions — tier detected at login, cached for the session
+    # Subscription games — luna.amazon.se/subscription/luna-*
     # ------------------------------------------------------------------
 
     async def get_subscriptions(self):
@@ -365,13 +347,13 @@ class LunaPlugin(Plugin):
             yield []
             return
         _, page_uri = self._tier_entry
-        data = await self._fetch_page_by_uri(page_uri)
+        data = await self._get_page(page_uri)
         if data is None:
             yield []
             return
         titles = _extract_titles(data, label=subscription_name)
         logger.info(
-            "Found %d subscription games for %s", len(titles), subscription_name
+            "Found %d games for %s", len(titles), subscription_name
         )
         yield [
             SubscriptionGame(game_title=title, game_id=gid)
