@@ -83,7 +83,7 @@ def _make_page_service_token(page_id, page_type):
 
 
 def _build_get_page_body(page_type):
-    """Build the getPage request body matching what the Luna web app sends."""
+    """Build the getPage request body using serviceToken (for library/home pages)."""
     return json.dumps(
         {
             "timeout": 10000,
@@ -92,6 +92,24 @@ def _build_get_page_body(page_type):
             "clientContext": _CLIENT_CONTEXT,
             "inputContext": {"gamepadTypes": []},
             "serviceToken": _make_page_service_token("default", page_type),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _build_page_context_body(page_uri):
+    """Build the getPage request body using pageContext (for subscription/channel pages)."""
+    return json.dumps(
+        {
+            "timeout": 10000,
+            "featureScheme": "WEB_V1",
+            "cacheKey": str(uuid.uuid4()),
+            "clientContext": _CLIENT_CONTEXT,
+            "inputContext": {"gamepadTypes": []},
+            "pageContext": {
+                "pageId": "default",
+                "pageUri": page_uri,
+            },
         },
         separators=(",", ":"),
     )
@@ -205,7 +223,7 @@ class LunaPlugin(Plugin):
         }
 
     async def _fetch_page(self, page_type):
-        """Call getPage and return the parsed JSON, or None on failure."""
+        """Call getPage via serviceToken and return parsed JSON, or None."""
         http = await self._get_session()
         async with http.post(
             _API_BASE + "/getPage",
@@ -217,6 +235,23 @@ class LunaPlugin(Plugin):
                 logger.error(
                     "getPage(%s) failed: %s | %s",
                     page_type, resp.status, text[:300],
+                )
+                return None
+            return await resp.json(content_type=None)
+
+    async def _fetch_page_by_uri(self, page_uri):
+        """Call getPage via pageContext URI and return parsed JSON, or None."""
+        http = await self._get_session()
+        async with http.post(
+            _API_BASE + "/getPage",
+            headers=self._build_headers(),
+            data=_build_page_context_body(page_uri),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error(
+                    "getPage(uri=%s) failed: %s | %s",
+                    page_uri, resp.status, text[:300],
                 )
                 return None
             return await resp.json(content_type=None)
@@ -306,12 +341,18 @@ class LunaPlugin(Plugin):
     async def get_subscription_games(self, subscription_name, context):
         if not self._cookies:
             raise AuthenticationRequired()
-        data = await self._fetch_page("landing_library")
+
+        # Use the subscription channel page URI (no quick_search filter so we
+        # get the full list rather than just "most played").
+        page_uri = "subscription/luna-standard?channel=luna-standard&sort_by=A_Z"
+        data = await self._fetch_page_by_uri(page_uri)
         if data is None:
             yield []
             return
-        titles = _extract_titles(data, label="landing_library")
-        logger.info("Found %d subscription games in Luna library", len(titles))
+        titles = _extract_titles(data, label="subscription/luna-standard")
+        logger.info(
+            "Found %d subscription games via channel page", len(titles)
+        )
         yield [
             SubscriptionGame(game_title=title, game_id=gid)
             for gid, title in titles.items()
