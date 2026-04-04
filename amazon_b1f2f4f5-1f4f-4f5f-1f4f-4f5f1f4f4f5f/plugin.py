@@ -14,9 +14,10 @@ from galaxy.api.consts import LicenseType, Platform, SubscriptionDiscovery
 from galaxy.api.errors import AuthenticationRequired, InvalidCredentials
 from galaxy.api.plugin import Plugin, create_and_run_plugin
 from galaxy.api.types import (
-    Achievement,
     Authentication,
     Game,
+    GameLibrarySettings,
+    GameTime,
     LicenseInfo,
     NextStep,
     Subscription,
@@ -48,6 +49,8 @@ _SESSION_COOKIES = ("session-id", "session-token", "x-main", "at-main")
 _API_BASE = "https://proxy-prod.eu-west-1.tempo.digital.a2z.com"
 
 _MARKETPLACE = "A2NODRKZP88ZB9"  # Sweden
+
+_LUNA_BASE = "https://luna.amazon.se"
 
 # Maps subscriber_tier (lowercase) found on luna.amazon.se to
 # (GOG subscription name, getPage pageUri).
@@ -118,9 +121,9 @@ def _cookie_header(cookies):
 # ---------------------------------------------------------------------------
 
 
-def _extract_titles(page_data, label="page"):
-    """Walk the widget tree and return {game_id: title} for all game tiles."""
-    games = {}
+def _extract_tiles(page_data, label="page"):
+    """Walk the widget tree, return {game_id: presentationData} for tiles."""
+    tiles = {}
     type_counts = {}
 
     def walk(widgets):
@@ -133,10 +136,9 @@ def _extract_titles(page_data, label="page"):
                 except (ValueError, TypeError):
                     continue
                 game_id = pd.get("gameId")
-                title = pd.get("title")
-                if game_id and title and game_id not in games:
-                    games[game_id] = title
-                elif game_id and not title:
+                if game_id and game_id not in tiles:
+                    tiles[game_id] = pd
+                elif game_id and not pd.get("title"):
                     logger.debug("[%s] tile %s has no title", label, game_id)
             if "widgets" in widget:
                 walk(widget["widgets"])
@@ -150,7 +152,7 @@ def _extract_titles(page_data, label="page"):
     for group in groups.values():
         walk(group.get("widgets", []))
     logger.info("[%s] widget types: %s", label, type_counts)
-    return games
+    return tiles
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +193,8 @@ class LunaPlugin(Plugin):
             "User-Agent": _USER_AGENT,
             "Accept": "*/*",
             "Content-Type": "text/plain;charset=UTF-8",
-            "Origin": "https://luna.amazon.se",
-            "Referer": "https://luna.amazon.se/",
+            "Origin": _LUNA_BASE,
+            "Referer": _LUNA_BASE + "/",
             "Cookie": _cookie_header(self._cookies),
             "x-amz-access-token": at_main,
             "x-amz-marketplace-id": _MARKETPLACE,
@@ -251,7 +253,7 @@ class LunaPlugin(Plugin):
         """Populate username and subscription tier from Amazon/Luna pages."""
         self._user_id = self._cookies.get("session-id", "luna-user")
 
-        # Username
+        # Username from amazon.com
         html = await self._get_html("https://www.amazon.com/")
         if html:
             m = re.search(r'data-test-id="profile_name">([^<]+)<', html)
@@ -262,8 +264,8 @@ class LunaPlugin(Plugin):
                 logger.warning("profile_name not found on amazon.com")
         self._display_name = self._display_name or self._user_id
 
-        # Subscription tier
-        html = await self._get_html("https://luna.amazon.se/")
+        # Subscription tier from luna.amazon.se
+        html = await self._get_html(_LUNA_BASE + "/")
         if html:
             m = re.search(
                 r'data-test-id="subscriber_tier">([^<]+)<', html
@@ -313,16 +315,16 @@ class LunaPlugin(Plugin):
         data = await self._get_page("purchased")
         if data is None:
             return []
-        titles = _extract_titles(data, label="purchased")
-        logger.info("Found %d owned games", len(titles))
+        tiles = _extract_tiles(data, label="purchased")
+        logger.info("Found %d owned games", len(tiles))
         return [
             Game(
                 game_id=gid,
-                game_title=title,
+                game_title=pd.get("title", gid),
                 dlcs=None,
                 license_info=LicenseInfo(LicenseType.SinglePurchase),
             )
-            for gid, title in titles.items()
+            for gid, pd in tiles.items()
         ]
 
     # ------------------------------------------------------------------
@@ -354,15 +356,90 @@ class LunaPlugin(Plugin):
         if data is None:
             yield []
             return
-        titles = _extract_titles(data, label=subscription_name)
-        logger.info(
-            "Found %d games for %s", len(titles), subscription_name
-        )
+        tiles = _extract_tiles(data, label=subscription_name)
+        logger.info("Found %d games for %s", len(tiles), subscription_name)
         yield [
-            SubscriptionGame(game_title=title, game_id=gid)
-            for gid, title in titles.items()
+            SubscriptionGame(game_title=pd.get("title", gid), game_id=gid)
+            for gid, pd in tiles.items()
         ]
 
+    # ------------------------------------------------------------------
+    # Launch — opens luna.amazon.se/play/{game_id} in the browser
+    # ------------------------------------------------------------------
+
+    async def launch_game(self, game_id):
+        await self.open_uri("{}/play/{}".format(_LUNA_BASE, game_id))
+
+    # ------------------------------------------------------------------
+    # Game time — per-game playtime from luna.amazon.se/game/{id}
+    # ------------------------------------------------------------------
+
+    async def get_game_time(self, game_id, context):
+        if not self._cookies:
+            raise AuthenticationRequired()
+        # context is the {game_id: pd} dict built in prepare_game_times_context
+        pd = (context or {}).get(game_id, {})
+        time_played = pd.get("minutesPlayed")
+        last_played = pd.get("lastPlayedTime")  # unix timestamp or None
+        logger.info(
+            "GameTime %s: played=%s min, last=%s",
+            game_id, time_played, last_played,
+        )
+        return GameTime(
+            game_id=game_id,
+            time_played=int(time_played) if time_played is not None else None,
+            last_played_time=(
+                int(last_played) if last_played is not None else None
+            ),
+        )
+
+    async def prepare_game_times_context(self, game_ids):
+        """Fetch the game detail page for each owned game once and cache the
+        presentationData so get_game_time() doesn't need an extra HTTP call."""
+        if not self._cookies:
+            return {}
+        context = {}
+        for gid in game_ids:
+            data = await self._get_page("game/{}".format(gid))
+            if data is None:
+                continue
+            groups = data.get("pageMemberGroups", {})
+            type_counts = {}
+            for group in groups.values():
+                for widget in group.get("widgets", []):
+                    wtype = widget.get("type", "UNKNOWN")
+                    type_counts[wtype] = type_counts.get(wtype, 0) + 1
+                    raw = widget.get("presentationData")
+                    if raw:
+                        try:
+                            pd = json.loads(raw)
+                            if pd.get("gameId") == gid:
+                                context[gid] = pd
+                                break
+                        except (ValueError, TypeError):
+                            pass
+            logger.info(
+                "[game/%s] widget types: %s", gid, type_counts
+            )
+        return context
+
+    # ------------------------------------------------------------------
+    # Tags / metadata — genres from presentationData
+    # ------------------------------------------------------------------
+
+    async def get_game_library_settings(self, game_id, context):
+        if not self._cookies:
+            raise AuthenticationRequired()
+        # context is the same {game_id: pd} dict from prepare context
+        pd = (context or {}).get(game_id, {})
+        genres = pd.get("genres") or pd.get("tags") or []
+        tags = [str(g) for g in genres] if genres else None
+        return GameLibrarySettings(game_id=game_id, tags=tags, hidden=None)
+
+    async def prepare_game_library_settings_context(self, game_ids):
+        """Reuse game detail pages already fetched; avoids duplicate calls
+        when game time and tags are imported in the same session."""
+        return await self.prepare_game_times_context(game_ids)
 
     # ------------------------------------------------------------------
     # Achievements — luna.amazon.se/game/{game_id}/achievements
@@ -376,8 +453,6 @@ class LunaPlugin(Plugin):
         )
         if data is None:
             return []
-        # Log full structure so we can identify the achievement widget type.
-        # Parser will be filled in once the widget format is known from logs.
         groups = data.get("pageMemberGroups", {})
         logger.info(
             "[achievements/%s] groups: %s",
