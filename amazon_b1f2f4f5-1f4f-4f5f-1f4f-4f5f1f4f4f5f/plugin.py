@@ -126,7 +126,7 @@ def _extract_titles(page_data, label="page"):
         for widget in widgets:
             wtype = widget.get("type", "UNKNOWN")
             type_counts[wtype] = type_counts.get(wtype, 0) + 1
-            if wtype == "GAME_TILE_VERTICAL":
+            if wtype in ("GAME_TILE_VERTICAL", "GAME_TILE"):
                 try:
                     pd = json.loads(widget.get("presentationData", "{}"))
                 except (ValueError, TypeError):
@@ -278,7 +278,9 @@ class LunaPlugin(Plugin):
                     )
                     self._tier_entry = _SUBSCRIPTION_TIERS["luna standard"]
             else:
-                logger.info("No subscriber_tier found — no active subscription")
+                logger.info(
+                    "No subscriber_tier found — no active subscription"
+                )
 
     # ------------------------------------------------------------------
     # Authentication
