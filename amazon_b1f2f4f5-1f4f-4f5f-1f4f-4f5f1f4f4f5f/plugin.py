@@ -253,20 +253,18 @@ class LunaPlugin(Plugin):
         """Populate username and subscription tier from Amazon/Luna pages."""
         self._user_id = self._cookies.get("session-id", "luna-user")
 
-        # Username from amazon.com
-        html = await self._get_html("https://www.amazon.com/")
+        # Fetch luna.amazon.se once — extract both username and tier.
+        html = await self._get_html(_LUNA_BASE + "/")
         if html:
+            # Username
             m = re.search(r'data-test-id="profile_name">([^<]+)<', html)
             if m:
                 self._display_name = m.group(1).strip()
                 logger.info("Logged in as: %s", self._display_name)
             else:
-                logger.warning("profile_name not found on amazon.com")
-        self._display_name = self._display_name or self._user_id
+                logger.warning("profile_name not found on luna.amazon.se")
 
-        # Subscription tier from luna.amazon.se
-        html = await self._get_html(_LUNA_BASE + "/")
-        if html:
+            # Subscription tier
             m = re.search(
                 r'data-test-id="subscriber_tier">([^<]+)<', html
             )
@@ -284,6 +282,23 @@ class LunaPlugin(Plugin):
                 logger.info(
                     "No subscriber_tier found — no active subscription"
                 )
+
+        # Fall back to amazon.com for username if Luna page didn't have it
+        if not self._display_name:
+            html = await self._get_html("https://www.amazon.com/")
+            if html:
+                m = re.search(
+                    r'data-test-id="profile_name">([^<]+)<', html
+                )
+                if m:
+                    self._display_name = m.group(1).strip()
+                    logger.info(
+                        "Logged in as (amazon.com): %s", self._display_name
+                    )
+                else:
+                    logger.warning("profile_name not found on amazon.com")
+
+        self._display_name = self._display_name or self._user_id
 
     # ------------------------------------------------------------------
     # Authentication
