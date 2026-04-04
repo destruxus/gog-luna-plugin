@@ -51,7 +51,21 @@ _API_BASE = "https://proxy-prod.eu-west-1.tempo.digital.a2z.com"
 
 _MARKETPLACE = "A2NODRKZP88ZB9"  # Sweden
 
-_SUBSCRIPTION_NAME = "Luna Standard"
+# Maps the subscriber_tier text (lowercase) found on luna.amazon.se to:
+#   (GOG subscription name, getPage pageUri for the full game list)
+_SUBSCRIPTION_TIERS = {
+    "luna standard": (
+        "Luna Standard",
+        "subscription/luna-standard"
+        "?channel=luna-standard&quick_search=title_a_to_z",
+    ),
+    "luna premium": (
+        "Luna Premium",
+        "subscription/luna-premium/B085TRCCT6"
+        "?quick_search=title_a_to_z"
+        "&channel=amzn1.adg.product.065de039-f85c-40f0-9d69-33020370912c",
+    ),
+}
 
 _CLIENT_CONTEXT = {
     "browserMetadata": {
@@ -303,18 +317,27 @@ class LunaPlugin(Plugin):
             logger.warning("Could not fetch Amazon homepage: %s", exc)
         return user_id, user_id
 
-    async def _fetch_subscription_owned(self):
-        """Return True if the Luna page shows an active subscriber_tier."""
+    async def _fetch_subscription_tier(self):
+        """Return the (sub_name, page_uri) tuple for the user's active Luna
+        subscription, or None if no recognised tier is found."""
         html = await self._fetch_luna_page_html()
         if not html:
-            return False
+            return None
         match = re.search(r'data-test-id="subscriber_tier">([^<]+)<', html)
-        if match:
-            tier = match.group(1).strip()
-            logger.info("Luna subscriber_tier: %s", tier)
-            return True
-        logger.info("subscriber_tier not found — user may not have Luna access")
-        return False
+        if not match:
+            logger.info(
+                "subscriber_tier not found — user may not have Luna access"
+            )
+            return None
+        tier_raw = match.group(1).strip()
+        logger.info("Luna subscriber_tier: %s", tier_raw)
+        entry = _SUBSCRIPTION_TIERS.get(tier_raw.lower())
+        if entry is None:
+            logger.warning(
+                "Unrecognised tier %r — defaulting to Luna Standard", tier_raw
+            )
+            entry = _SUBSCRIPTION_TIERS["luna standard"]
+        return entry
 
     async def authenticate(self, stored_credentials=None):
         if stored_credentials:
@@ -360,11 +383,14 @@ class LunaPlugin(Plugin):
     async def get_subscriptions(self):
         if not self._cookies:
             raise AuthenticationRequired()
-        owned = await self._fetch_subscription_owned()
+        entry = await self._fetch_subscription_tier()
+        if entry is None:
+            return []
+        sub_name, _ = entry
         return [
             Subscription(
-                subscription_name=_SUBSCRIPTION_NAME,
-                owned=owned,
+                subscription_name=sub_name,
+                owned=True,
                 subscription_discovery=SubscriptionDiscovery.AUTOMATIC,
             )
         ]
@@ -373,16 +399,20 @@ class LunaPlugin(Plugin):
         if not self._cookies:
             raise AuthenticationRequired()
 
-        # Use the subscription channel page URI (no quick_search filter so we
-        # get the full list rather than just "most played").
-        page_uri = "subscription/luna-standard?channel=luna-standard&sort_by=A_Z"
+        # Re-detect the tier so we use the correct page URI for whatever
+        # subscription this user actually holds.
+        entry = await self._fetch_subscription_tier()
+        if entry is None:
+            yield []
+            return
+        _, page_uri = entry
         data = await self._fetch_page_by_uri(page_uri)
         if data is None:
             yield []
             return
-        titles = _extract_titles(data, label="subscription/luna-standard")
+        titles = _extract_titles(data, label=subscription_name)
         logger.info(
-            "Found %d subscription games via channel page", len(titles)
+            "Found %d subscription games for %s", len(titles), subscription_name
         )
         yield [
             SubscriptionGame(game_title=title, game_id=gid)
