@@ -306,8 +306,10 @@ class LunaPlugin(Plugin):
                     self._tier_entry = _SUBSCRIPTION_TIERS["luna standard"]
             else:
                 logger.info(
-                    "No subscriber_tier found — no active subscription"
+                    "subscriber_tier not in HTML (JS-rendered) — "
+                    "defaulting to Luna Standard"
                 )
+                self._tier_entry = _SUBSCRIPTION_TIERS["luna standard"]
 
         self._display_name = self._display_name or self._user_id
 
