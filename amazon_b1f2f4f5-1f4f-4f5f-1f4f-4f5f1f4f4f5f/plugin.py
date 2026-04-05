@@ -53,20 +53,11 @@ _MARKETPLACE = "A2NODRKZP88ZB9"  # Sweden
 
 _LUNA_BASE = "https://luna.amazon.se"
 
-# Maps subscriber_tier (lowercase) found on luna.amazon.se to
-# (GOG subscription name, getPage pageUri).
+# Maps subscriber_tier (lowercase) to (GOG subscription name, pageType).
+# pageType is used with the serviceToken request format (not pageContext).
 _SUBSCRIPTION_TIERS = {
-    "luna standard": (
-        "Luna Standard",
-        "subscription/luna-standard"
-        "?channel=luna-standard&quick_search=title_a_to_z",
-    ),
-    "luna premium": (
-        "Luna Premium",
-        "subscription/luna-premium/B085TRCCT6"
-        "?quick_search=title_a_to_z"
-        "&channel=amzn1.adg.product.065de039-f85c-40f0-9d69-33020370912c",
-    ),
+    "luna standard": ("Luna Standard", "landing_library"),
+    "luna premium": ("Luna Premium", "landing_library"),
 }
 
 _CLIENT_CONTEXT = {
@@ -99,6 +90,28 @@ def _build_body(page_uri):
             "clientContext": _CLIENT_CONTEXT,
             "inputContext": {"gamepadTypes": []},
             "pageContext": {"pageId": "default", "pageUri": page_uri},
+        },
+        separators=(",", ":"),
+    )
+
+
+def _build_body_st(page_type):
+    """Build a getPage POST body using serviceToken (for library pages)."""
+    token = base64.b64encode(
+        json.dumps(
+            {"encryptPageId": False, "pageId": "default",
+             "pageType": page_type},
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+    return json.dumps(
+        {
+            "timeout": 10000,
+            "featureScheme": "WEB_V1",
+            "cacheKey": str(uuid.uuid4()),
+            "clientContext": _CLIENT_CONTEXT,
+            "inputContext": {"gamepadTypes": []},
+            "serviceToken": token,
         },
         separators=(",", ":"),
     )
@@ -235,7 +248,7 @@ class LunaPlugin(Plugin):
         }
 
     async def _get_page(self, page_uri):
-        """POST to /getPage and return parsed JSON, or None on error."""
+        """POST to /getPage using pageContext, return JSON or None."""
         http = await self._get_session()
         async with http.post(
             _API_BASE + "/getPage",
@@ -246,6 +259,22 @@ class LunaPlugin(Plugin):
                 logger.error(
                     "getPage(%s) → %s | %s",
                     page_uri, resp.status, (await resp.text())[:300],
+                )
+                return None
+            return await resp.json(content_type=None)
+
+    async def _get_page_st(self, page_type):
+        """POST to /getPage using serviceToken, return JSON or None."""
+        http = await self._get_session()
+        async with http.post(
+            _API_BASE + "/getPage",
+            headers=self._api_headers(),
+            data=_build_body_st(page_type),
+        ) as resp:
+            if resp.status != 200:
+                logger.error(
+                    "getPage(st:%s) → %s | %s",
+                    page_type, resp.status, (await resp.text())[:300],
                 )
                 return None
             return await resp.json(content_type=None)
@@ -397,8 +426,8 @@ class LunaPlugin(Plugin):
         if self._tier_entry is None:
             yield []
             return
-        _, page_uri = self._tier_entry
-        data = await self._get_page(page_uri)
+        _, page_type = self._tier_entry
+        data = await self._get_page_st(page_type)
         if data is None:
             yield []
             return
