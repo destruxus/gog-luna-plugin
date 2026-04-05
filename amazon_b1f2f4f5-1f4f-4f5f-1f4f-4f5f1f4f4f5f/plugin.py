@@ -141,15 +141,26 @@ def _extract_tiles(page_data, label="page"):
                     tiles[game_id] = pd
                 elif game_id and not pd.get("title"):
                     logger.debug("[%s] tile %s has no title", label, game_id)
-            # Recurse into any known sub-widget key.
-            for key in ("widgets", "resultWidgets", "filteredWidgets"):
-                if key in widget and isinstance(widget[key], list):
-                    if key != "widgets":
-                        logger.debug(
-                            "[%s] recursing into %s.%s (%d)",
-                            label, wtype, key, len(widget[key]),
-                        )
-                    walk(widget[key])
+            # Log all keys for BROWSE widget so we can find the game list.
+            if wtype == "BROWSE_PILL_FILTER_ROW_WITH_RESULTS":
+                list_keys = [
+                    k for k, v in widget.items()
+                    if isinstance(v, list) and v
+                ]
+                logger.info(
+                    "[%s] BROWSE keys with lists: %s", label, list_keys
+                )
+            # Recurse into any list-valued key that may hold sub-widgets.
+            for key, val in widget.items():
+                if isinstance(val, list) and val:
+                    # Only recurse if items look like widgets (have "type").
+                    if isinstance(val[0], dict) and "type" in val[0]:
+                        if key != "widgets":
+                            logger.debug(
+                                "[%s] recursing into %s.%s (%d)",
+                                label, wtype, key, len(val),
+                            )
+                        walk(val)
 
     groups = page_data.get("pageMemberGroups", {})
     logger.info(
