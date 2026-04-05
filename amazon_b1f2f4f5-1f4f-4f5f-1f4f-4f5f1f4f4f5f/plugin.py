@@ -1,5 +1,6 @@
 """GOG Galaxy - Amazon Luna Plugin."""
 
+import base64
 import json
 import logging
 import re
@@ -249,22 +250,47 @@ class LunaPlugin(Plugin):
     # Profile + subscription — loaded once at login
     # ------------------------------------------------------------------
 
+    def _name_from_xmain(self):
+        """Decode x-main cookie — returns customer name or None."""
+        raw = self._cookies.get("x-main", "")
+        if not raw:
+            return None
+        try:
+            # x-main is a base64-encoded JSON blob; pad as needed.
+            padded = raw + "=" * (-len(raw) % 4)
+            data = json.loads(base64.b64decode(padded).decode("utf-8"))
+            name = data.get("customerName") or data.get("name")
+            if name:
+                logger.info("Username from x-main: %s", name)
+            else:
+                logger.debug("x-main keys: %s", list(data.keys()))
+            return name or None
+        except Exception as exc:
+            logger.debug("x-main decode failed: %s", exc)
+            return None
+
     async def _load_user_info(self):
-        """Populate username and subscription tier from Amazon/Luna pages."""
+        """Populate username and subscription tier from Luna."""
         self._user_id = self._cookies.get("session-id", "luna-user")
 
-        # Fetch luna.amazon.se once — extract both username and tier.
+        # 1. Try to decode username from x-main cookie (Luna/Amazon token).
+        self._display_name = self._name_from_xmain()
+
+        # 2. Fetch luna.amazon.se — subscription tier + username fallback.
         html = await self._get_html(_LUNA_BASE + "/")
         if html:
-            # Username
-            m = re.search(r'data-test-id="profile_name">([^<]+)<', html)
-            if m:
-                self._display_name = m.group(1).strip()
-                logger.info("Logged in as: %s", self._display_name)
-            else:
-                logger.warning("profile_name not found on luna.amazon.se")
+            if not self._display_name:
+                m = re.search(
+                    r'data-test-id="profile_name">([^<]+)<', html
+                )
+                if m:
+                    self._display_name = m.group(1).strip()
+                    logger.info("Logged in as: %s", self._display_name)
+                else:
+                    logger.warning(
+                        "profile_name not found on luna.amazon.se"
+                    )
 
-            # Subscription tier
             m = re.search(
                 r'data-test-id="subscriber_tier">([^<]+)<', html
             )
@@ -282,26 +308,6 @@ class LunaPlugin(Plugin):
                 logger.info(
                     "No subscriber_tier found — no active subscription"
                 )
-
-        # Fall back to Amazon storefronts for username if Luna page missed it
-        if not self._display_name:
-            for url in (
-                "https://www.amazon.se/",
-                "https://www.amazon.com/",
-            ):
-                html = await self._get_html(url)
-                if not html:
-                    continue
-                m = re.search(
-                    r'data-test-id="profile_name">([^<]+)<', html
-                )
-                if m:
-                    self._display_name = m.group(1).strip()
-                    logger.info(
-                        "Logged in as (%s): %s", url, self._display_name
-                    )
-                    break
-                logger.warning("profile_name not found on %s", url)
 
         self._display_name = self._display_name or self._user_id
 
