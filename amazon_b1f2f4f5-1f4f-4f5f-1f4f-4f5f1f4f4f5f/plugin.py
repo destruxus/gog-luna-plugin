@@ -283,20 +283,25 @@ class LunaPlugin(Plugin):
                     "No subscriber_tier found — no active subscription"
                 )
 
-        # Fall back to amazon.com for username if Luna page didn't have it
+        # Fall back to Amazon storefronts for username if Luna page missed it
         if not self._display_name:
-            html = await self._get_html("https://www.amazon.com/")
-            if html:
+            for url in (
+                "https://www.amazon.se/",
+                "https://www.amazon.com/",
+            ):
+                html = await self._get_html(url)
+                if not html:
+                    continue
                 m = re.search(
                     r'data-test-id="profile_name">([^<]+)<', html
                 )
                 if m:
                     self._display_name = m.group(1).strip()
                     logger.info(
-                        "Logged in as (amazon.com): %s", self._display_name
+                        "Logged in as (%s): %s", url, self._display_name
                     )
-                else:
-                    logger.warning("profile_name not found on amazon.com")
+                    break
+                logger.warning("profile_name not found on %s", url)
 
         self._display_name = self._display_name or self._user_id
 
